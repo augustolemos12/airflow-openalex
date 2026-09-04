@@ -90,7 +90,7 @@ De esta manera, una caída de la API no impide obtener un dataset válido para c
 | `check_source` | `@task.branch` | Decide el camino del DAG (`land_bronze` o `load_frozen`) según el resultado del sensor recuperado mediante XCom. |
 | `land_bronze` | Capa Bronce | Realiza las peticiones HTTP masivas a OpenAlex. Utiliza paginación mediante cursor para superar el límite de 10.000 filas y almacena los JSON crudos comprimidos en `.json.gz`. Implementa idempotencia evitando volver a descargar el archivo del día si ya existe. |
 | `load_frozen` | Respaldo | Carga el respaldo congelado cuando la API no está disponible, permitiendo que el pipeline continúe utilizando datos de contingencia. |
-| `refine_silver` | Capa Plata | No realiza peticiones de red. Lee y descomprime los archivos Bronce mediante `bronze_read()`, desanida las estructuras JSON, tipa las columnas, elimina IDs duplicados y genera `openalex_silver.csv`. |
+| `refine_silver` | Capa Plata |No realiza peticiones de red. Lee y descomprime los archivos Bronce de forma iterativa (línea por línea) para optimizar el uso de memoria RAM, desanida las estructuras JSON, tipa las columnas, elimina IDs duplicados y genera `openalex_silver.csv`. |
 | `validate` | Control de Calidad | Utiliza la regla `NONE_FAILED_MIN_ONE_SUCCESS`. Verifica que el dataset tenga más de 1.000 filas, que no existan IDs duplicados y que `cited_by_count` no contenga valores nulos. |
 | `save` | Publicación | Genera el entregable final con fecha lógica (`openalex_YYYY-MM-DD.csv`) en `OUTPUT_DIR` y actualiza `ULTIMO_OK` en `FROZEN_DIR` cuando los datos provienen de una ejecución exitosa contra la fuente. |
 
@@ -143,7 +143,7 @@ La Capa Bronce conserva los datos prácticamente en el estado en que fueron obte
 ### Características
 
 - Datos crudos provenientes de la API.
-- Formato JSON.
+- Formato JSONL (json lines).
 - Compresión mediante `gzip`.
 - Archivos con extensión `.json.gz`.
 - Almacenamiento local.
@@ -261,19 +261,13 @@ Permite centralizar la estructura de almacenamiento de los archivos Bronce.
 
 ### `bronze_write(destino, works)`
 
-Serializa una lista de diccionarios y la almacena como JSON comprimido mediante `gzip`.
+Itera la lista de resultados y serializa cada trabajo como un string JSON independiente seguido de un salto de línea, almacenándolo comprimido mediante gzip.
 
 Su objetivo es:
 
 - Persistir los datos crudos.
 - Reducir el espacio utilizado.
 - Mantener un formato que pueda ser regenerado posteriormente.
-
-### `bronze_read(ruta)`
-
-Lee un archivo `.json.gz`, lo descomprime y devuelve su contenido para ser procesado por la Capa Plata.
-
-Esto permite que `refine_silver` trabaje exclusivamente con datos locales.
 
 ### `fetch_page(session, cursor, correo, api_key)`
 
@@ -408,7 +402,7 @@ De esta forma, la disponibilidad de la fuente externa no constituye un punto ún
 - **Apache Airflow**
 - **HttpHook**
 - **OpenAlex API**
-- **JSON**
+- **JSONL**
 - **Gzip**
 - **CSV**
 - **Modelo Medallón**

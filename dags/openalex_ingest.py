@@ -15,7 +15,7 @@ guarda el resultado en CSV y realiza validaciones de calidad de datos.
 
 **Dos capas del modelo medallón:**
 
-* **Bronce** (`land_bronze`) — los JSON crudos comprimidos con gzip. Es la única
+* **Bronce** (`land_bronze`) — los registros JSON crudos en formato JSONL, comprimidos con gzip. Es la única
   tarea que toca la red. No interpreta nada.
 * **Plata** (`refine_silver`) — filas tipadas, una por paper, deduplicadas y validadas.
   No toca la red: lee del bronce.
@@ -59,29 +59,6 @@ BASE_URL = "https://api.openalex.org/works"
 def bronze_path(fecha_str: str) -> Path:
     """Ruta canónica del archivo bronce para una fecha dada."""
     return BRONCE_DIR / f"openalex_raw_{fecha_str}.json.gz"
-
-
-def bronze_write(destino: Path, works: list) -> None:
-    """Serializa la lista de works y la guarda comprimida con gzip.
-
-    El JSON de 12.000 artículos ocupa ~150 MB sin comprimir; con gzip baja a
-    ~30 MB, un ahorro del ~80 % sin ningún costo en tiempo de lectura notable.
-    """
-    destino.parent.mkdir(parents=True, exist_ok=True)
-    with gzip.open(destino, "wt", encoding="utf-8") as f:
-        json.dump(works, f, ensure_ascii=False)
-
-
-def bronze_read(ruta: Path) -> list:
-    """Descomprime y deserializa el bronce. Devuelve la lista completa en memoria.
-
-    Para 12.000 registros el JSON descomprimido ocupa ~30-50 MB en RAM,
-    perfectamente manejable. Sustituye el streaming con ijson, que no puede
-    hacer streaming verdadero sobre un stream gzip de forma simple.
-    """
-    with gzip.open(ruta, "rt", encoding="utf-8") as f:
-        return json.load(f)
-
 
 def fetch_page(session, cursor: str, correo: str, api_key: str | None) -> tuple[list, str | None]:
     """Pide una página de 100 works a OpenAlex y devuelve (resultados, next_cursor).
@@ -196,14 +173,7 @@ def openalex_ingest():
 
     @task(retries=3, retry_delay=pendulum.duration(seconds=15))
     def land_bronze(**context) -> str:
-        """Capa Bronce: descarga y guarda los JSON crudos comprimidos con gzip.
-
-        No interpreta, limpia ni parsea nada. Preserva la respuesta original de
-        la API para permitir reprocesamientos sin volver a consultar la red.
-
-        Es la única tarea que toca la red. Si el archivo del día ya existe en
-        disco y `force=False`, lo reutiliza sin hacer ninguna request.
-        """
+        """Capa Bronce: descarga y guarda JSONL comprimidos con gzip iterativamente."""
         dag_run   = context["dag_run"]
         momento   = dag_run.logical_date or dag_run.run_after
         fecha_str = momento.date().isoformat()
@@ -211,14 +181,8 @@ def openalex_ingest():
 
         destino = bronze_path(fecha_str)
 
-        # Idempotencia: reutilizar el bronce del día si ya existe.
-        # destino.stat().st_size devuelve el tamaño del archivo en bytes
         if destino.exists() and destino.stat().st_size > 0 and not force:
-            log.info(
-                "Bronce del %s ya existe (%s bytes). Omitiendo descarga. "
-                "Usá force=True para forzar una re-ingesta.",
-                fecha_str, destino.stat().st_size,
-            )
+            log.info("Bronce del %s ya existe (%s bytes). Omitiendo.", fecha_str, destino.stat().st_size)
             return str(destino)
 
         hook     = HttpHook(method="GET", http_conn_id=CONN_ID)
@@ -228,19 +192,26 @@ def openalex_ingest():
         filas_objetivo = context["params"]["filas_objetivo"]
         correo         = context["params"]["correo_api"]
         cursor         = "*"
-        raw_works: list = []
+        total_descargados = 0
 
         session = hook.get_conn()
         log.info("Capa Bronce: iniciando descarga desde OpenAlex API...")
 
-        while len(raw_works) < filas_objetivo and cursor is not None:
-            resultados, cursor = fetch_page(session, cursor, correo, api_key)
-            # raw_works.extend() es un método que se usa para agregar los elementos de una lista a otra lista
-            raw_works.extend(resultados)
-            log.info("Registros acumulados: %s", len(raw_works))
+        destino.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Abrimos el gzip de escritura acá, y escribimos a medida que paginamos
+        with gzip.open(destino, "wt", encoding="utf-8") as f:
+            while total_descargados < filas_objetivo and cursor is not None:
+                resultados, cursor = fetch_page(session, cursor, correo, api_key)
+                
+                # Escribimos los 100 resultados de esta página y liberamos la memoria
+                for work in resultados:
+                    f.write(json.dumps(work, ensure_ascii=False) + "\n")
+                
+                total_descargados += len(resultados)
+                log.info("Registros acumulados: %s", total_descargados)
 
-        bronze_write(destino, raw_works)
-        log.info("Capa Bronce guardada en %s (%s registros)", destino, len(raw_works))
+        log.info("Capa Bronce guardada en %s (%s registros)", destino, total_descargados)
         return str(destino)
 
     # ------------------------------------------------------------------
@@ -284,8 +255,8 @@ def openalex_ingest():
     def refine_silver(ruta_bronce: str) -> str:
         """Capa Plata: lee el bronce, tipa, limpia y genera el CSV estructurado.
 
-        No toca la red. Todo lo lee del archivo guardado en disco por land_bronze.
-        Usa bronze_read() que descomprime gzip y carga la lista en memoria.
+        No toca la red. Lee el JSONL comprimido directamente desde la capa Bronce,
+        procesando los registros línea por línea para reducir el consumo de memoria.
         """
         import csv
 
@@ -302,32 +273,50 @@ def openalex_ingest():
         ids_vistos: set = set()
         total_filas = 0
 
-        works = bronze_read(Path(ruta_bronce))
-
-        with open(destino_plata, "w", newline="", encoding="utf-8") as f_out:
+        with gzip.open(ruta_bronce, "rt", encoding="utf-8") as f_in, \
+             open(destino_plata, "w", newline="", encoding="utf-8") as f_out:
+            
             writer = csv.DictWriter(f_out, fieldnames=COLUMNAS)
             writer.writeheader()
             buffer = []
 
-            for work in works:
+            # Leer línea por línea sin saturar la RAM
+            for linea in f_in:
+                work = json.loads(linea)
                 work_id = work.get("id")
+                if not work_id:
+                    log.warning("Work sin ID encontrado. Se omite.")
+                    continue
+
+                work_id = work_id.rsplit("/", 1)[-1]
+
                 if work_id in ids_vistos:
-                    continue  # deduplicación
+                    continue
+
                 ids_vistos.add(work_id)
 
                 buffer.append({
-                    "id":                      work_id.removeprefix("https://openalex.org/"),
-                    "title":                   work.get("title"),
-                    "publication_year":        work.get("publication_year"),
-                    "cited_by_count":          work.get("cited_by_count"),
-                    "is_oa":                   work.get("open_access", {}).get("is_oa"),
-                    "authors_count":           len(work.get("authorships", [])),
-                    "referenced_works_count":  work.get("referenced_works_count"),
-                    "institutions_count":      len(work.get("institutions_distinct", [])),
-                    "countries_count":         work.get("countries_distinct_count", 0),
-                    "type":                    work.get("type"),
+                    "id": work_id,
+                    "title": work.get("title"),
+                    "publication_year": work.get("publication_year"),
+                    "cited_by_count": work.get("cited_by_count"),
+                    "is_oa": work.get("open_access", {}).get("is_oa"),
+                    "authors_count": len(work.get("authorships", [])),
+                    "referenced_works_count": len(work.get("referenced_works", [])),
+                    "institutions_count": len({
+                        institution.get("id")
+                        for authorship in work.get("authorships", [])
+                        for institution in authorship.get("institutions", [])
+                        if institution.get("id")
+                    }),
+                    "countries_count": len({
+                        country
+                        for authorship in work.get("authorships", [])
+                        for country in authorship.get("countries", [])
+                        if country
+                    }),
+                    "type": work.get("type"),
                 })
-
                 if len(buffer) >= CHUNK_SIZE:
                     writer.writerows(buffer)
                     total_filas += len(buffer)
