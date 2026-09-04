@@ -1,0 +1,7 @@
+# Astro Runtime includes the following pre-installed providers packages: https://www.astronomer.io/docs/astro/runtime-image-architecture#provider-packages
+pandas
+pendulum
+apache-airflow-providers-http>=6.0
+ijson
+
+

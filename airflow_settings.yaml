@@ -1,0 +1,7 @@
+airflow:
+  connections:
+    - conn_id: openalex_api
+      conn_type: http
+      host: api.openalex.org
+      schema: https
+      password: "6loOzZiMBxxEMX6saIPOfY"
