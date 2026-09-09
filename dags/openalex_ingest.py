@@ -100,7 +100,7 @@ def fetch_page(session, cursor: str, correo: str, api_key: str | None) -> tuple[
     doc_md=__doc__,
     params={
         "filas_objetivo": Param(
-            12000, type="integer", title="Cantidad aproximada de papers",
+            12000, type="integer", title="Cantidad de papers",
         ),
         "correo_api": Param(
             "tu_correo@utn.edu.ar", type="string", title="Polite Pool Email",
