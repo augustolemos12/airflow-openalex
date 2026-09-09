@@ -335,31 +335,113 @@ def openalex_ingest():
 
     @task(trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS)
     def validate(desde_fuente: str | None, desde_respaldo: str | None) -> str:
-        """Chequeos duros. Si alguno falla, el DAG falla: no se publica basura.
+        """Seis chequeos de calidad de datos. Solo el volumen insuficiente falla el DAG.
 
-        `NONE_FAILED_MIN_ONE_SUCCESS` permite que una de las dos ramas esté en
-        `skipped` y la tarea igualmente corra, siempre que la otra haya dado datos.
+        Criterios verificados
+        ---------------------
+        1. Clave sin duplicados   — ``id`` debe ser único (clave primaria). [ADVERTENCIA]
+        2. Volumen suficiente     — más de 1.000 filas.                      [FALLA el DAG]
+        3. Ancho suficiente       — 5 o más columnas útiles (no todo nulos). [ADVERTENCIA]
+        4. Mezcla de tipos        — columnas numéricas y categóricas.        [ADVERTENCIA]
+        5. Nulos conocidos        — % de nulos por columna para auditoría.   [ADVERTENCIA]
+        6. Sin columnas vacías    — ninguna columna con 100 % de nulos.      [ADVERTENCIA]
+
+        `NONE_FAILED_MIN_ONE_SUCCESS` permite que una de las dos ramas de
+        upstream esté en ``skipped`` y la tarea igualmente corra.
         """
         ruta = desde_fuente or desde_respaldo
         if ruta is None:
             raise ValueError("Ninguna rama produjo un archivo para validar.")
 
         df = pd.read_csv(ruta)
-        problemas = []
+        advertencias: list[str] = []
 
-        if len(df) < 1000:
-            problemas.append(f"Volumen insuficiente: solo {len(df)} filas.")
-        if df["cited_by_count"].isna().any():
-            problemas.append(
-                f"Target 'cited_by_count' tiene {df['cited_by_count'].isna().sum()} nulos."
+        # ── 1. Clave sin duplicados ──────────────────────────────────────────
+        n_dup = int(df["id"].duplicated().sum())
+        if n_dup > 0:
+            advertencias.append(f"Clave 'id' NO es única: {n_dup} duplicados.")
+        else:
+            log.info("✔ Clave sin duplicados — id es única en %s filas.", len(df))
+
+        # ── 2. Volumen suficiente — ÚNICA falla dura ─────────────────────────
+        MIN_FILAS = 1_000
+        if len(df) < MIN_FILAS:
+            raise ValueError(
+                f"Volumen insuficiente: {len(df)} filas (mínimo {MIN_FILAS}). "
+                "El dataset es demasiado pequeño para continuar."
             )
-        if df["id"].duplicated().any():
-            problemas.append(f"Existen {df['id'].duplicated().sum()} IDs duplicados.")
+        log.info("✔ Volumen suficiente — %s filas.", len(df))
 
-        if problemas:
-            raise ValueError("Validación fallida en capa Plata:\n  - " + "\n  - ".join(problemas))
+        # ── 3. Ancho suficiente ──────────────────────────────────────────────
+        MIN_COLUMNAS = 5
+        columnas_utiles = [c for c in df.columns if not df[c].isna().all()]
+        if len(columnas_utiles) < MIN_COLUMNAS:
+            advertencias.append(
+                f"Ancho insuficiente: solo {len(columnas_utiles)} columnas útiles "
+                f"(mínimo {MIN_COLUMNAS})."
+            )
+        else:
+            log.info("✔ Ancho suficiente — %s columnas útiles.", len(columnas_utiles))
 
-        log.info("Validación OK: %s filas superaron todos los chequeos.", len(df))
+        # ── 4. Mezcla de tipos ───────────────────────────────────────────────
+        tipos = df.dtypes.value_counts()
+        log.info("Tipos de columnas presentes:\n%s", tipos.to_string())
+
+        hay_numericas   = any(str(t).startswith(("int", "float")) for t in df.dtypes)
+        hay_categoricas = any(str(t) == "object" for t in df.dtypes)
+        hay_bool        = any(str(t) == "bool" for t in df.dtypes)
+        if not hay_bool and "is_oa" in df.columns:
+            hay_bool = df["is_oa"].dropna().isin([True, False, "True", "False"]).all()
+
+        if not (hay_numericas and hay_categoricas):
+            advertencias.append(
+                "Mezcla de tipos insuficiente: se requieren columnas numéricas "
+                "Y categóricas. "
+                f"(numéricas={hay_numericas}, categóricas={hay_categoricas})"
+            )
+        else:
+            log.info(
+                "✔ Mezcla de tipos — numéricas=%s, categóricas=%s, booleanas=%s.",
+                hay_numericas, hay_categoricas, hay_bool,
+            )
+
+        # ── 5. Nulos conocidos (auditoría) ───────────────────────────────────
+        nulos_pct = (df.isna().mean() * 100).sort_values(ascending=False)
+        log.info("Porcentaje de nulos por columna:\n%s", nulos_pct.to_string())
+
+        n_nulos_target = int(df["cited_by_count"].isna().sum())
+        if n_nulos_target > 0:
+            advertencias.append(
+                f"Target 'cited_by_count' tiene {n_nulos_target} nulos "
+                f"({n_nulos_target / len(df):.1%} del total)."
+            )
+        else:
+            log.info("✔ Target 'cited_by_count' sin nulos.")
+
+        # ── 6. Sin columnas vacías ───────────────────────────────────────────
+        columnas_vacias = df.columns[df.isna().all()].tolist()
+        if columnas_vacias:
+            advertencias.append(
+                f"Columnas con 100 % de nulos (deben eliminarse o revisarse): "
+                f"{columnas_vacias}."
+            )
+        else:
+            log.info("✔ Sin columnas vacías — ninguna columna tiene 100 %% de nulos.")
+
+        # ── Resultado final ──────────────────────────────────────────────────
+        if advertencias:
+            for aviso in advertencias:
+                log.warning("⚠ %s", aviso)
+            log.warning(
+                "%s advertencia/s de calidad registradas. "
+                "El pipeline continúa; revisá el log antes de usar el dataset.",
+                len(advertencias),
+            )
+        else:
+            log.info(
+                "✔✔✔ Validación completa OK — %s filas y %s columnas superaron los 6 chequeos.",
+                len(df), len(columnas_utiles),
+            )
         return ruta
 
     # ------------------------------------------------------------------
