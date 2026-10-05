@@ -1,5 +1,58 @@
 # Registro de cambios
 
+## v6: Ciencia de Materiales 2019 y Plata enriquecida
+
+**Archivos modificados:** `dags/openalex_ingest.py`, `README.md`
+
+### Población
+
+En Medicina 2023, el 34% de los artículos tenía 0 citas y la mediana era 2: el target casi no variaba. Se cambió a un campo con más citas y metadatos más completos, y a artículos con más edad:
+
+```text
+publication_year:2019,has_abstract:true,type:article,is_retracted:false,primary_topic.field.id:25
+```
+
+- `CAMPO_ID` pasa de 27 (Medicine) a 25 (Materials Science) y se agrega la constante `ANIO`.
+- Materials tiene pocos artículos sin citar, buena cobertura de revistas core y autorías chicas. Biochemistry tenía algo más de citas, pero es biomedicina y mezcla 14 subcampos. Physics tiene colaboraciones de cientos de autores.
+- En la muestra descargada (artículos en revistas): 12% con 0 citas, mediana 12, 84% en revistas core.
+
+### Nueva tarea `enrich_silver`
+
+Entre `refine_silver` y `validate`. Pide a `/sources`, `/authors` e `/institutions` la revista, el primer y el último autor y las instituciones de cada artículo, y agrega `COLUMNAS_ENRIQUECIDAS`: historia previa de la revista y de los autores (trabajos y citas **antes de `ANIO`**, para evitar fuga del target), APC de la revista, país del primer autor y h-index de la mejor institución.
+
+- Unas 270 llamadas para 10.000 artículos. En la corrida de prueba tardó ~5 minutos.
+- `validate` exige también las columnas nuevas.
+- En un experimento previo (gradient boosting, validación cruzada de 5 partes), sumar estas columnas subió la AUC del top 10% de 0,779 a 0,858.
+
+**Consecuencias:**
+- `include/frozen/ultimo_ok.csv.gz` se regeneró con la muestra nueva y las columnas enriquecidas.
+- El análisis exploratorio y `HIPOTESIS.md` hay que volver a medirlos sobre la muestra nueva.
+
+---
+
+## v5: población restringida a Medicina
+
+**Archivos modificados:** `dags/openalex_ingest.py`, `README.md`
+
+**Motivo:** el estudio se acota a un único dominio y campo, **Health Sciences / Medicine**. En la muestra v4, tomada sobre todos los campos, Medicine tenía 2.241 artículos después de los filtros del notebook, por debajo del mínimo de 5.000 que pide la materia. Por eso el campo se filtra directamente en la API y se descarga una muestra nueva de ese tema, en lugar de filtrar la muestra existente.
+
+**Cambio:** se agregó el filtro del campo a `FILTRO`, a través de la constante nueva `CAMPO_ID`:
+
+```text
+publication_year:2023,has_abstract:true,type:article,is_retracted:false,primary_topic.field.id:27
+```
+
+- El campo se toma del **tema principal** del artículo (`primary_topic`). `fields/27` es Medicine, dentro del dominio Health Sciences.
+- La población disponible en OpenAlex es de **850.807 artículos**. El muestreo (`sample` + `seed`, 12.000 artículos) no cambia.
+- Para estudiar otro campo alcanza con cambiar `CAMPO_ID`.
+
+**Consecuencias:**
+- `include/frozen/ultimo_ok.csv.gz` se regeneró con la muestra de Medicina.
+- Los resultados del análisis exploratorio y de las hipótesis (`HIPOTESIS.md`) corresponden a la muestra de todos los campos y hay que volver a medirlos.
+- Las variables `domain` y `field` pasan a ser constantes. La temática se estudia al nivel de subcampo o de tema.
+
+---
+
 ## v4: muestra aleatoria, solo artículos y esquema completo en Plata
 
 **Base de comparación:** `7e3cd9a` (DAG v3, 2026-09-04)
@@ -118,7 +171,7 @@ Los archivos se comprimen porque sin comprimir pesan ~200 MB para 12.000 artícu
 
 ### 6. ⚠️ Cambios incompatibles con v3 y pendientes
 
-1. **El respaldo actual no es compatible.** `include/frozen/ultimo_ok.csv` tiene el esquema de v3 (10 columnas) y el DAG ahora busca `ultimo_ok.csv.gz`. Hasta la primera corrida exitosa de v4, si la API está caída el DAG cae a la semilla y `validate` falla.
+1. **Respaldo regenerado con el esquema v4:** `include/frozen/ultimo_ok.csv.gz` (11.996 artículos × 151 columnas, 33 MB, 2026-09-23). Se eliminó el `include/frozen/ultimo_ok.csv` de v3 (10 columnas).
 2. **La semilla `include/frozen/openalex_snapshot.csv` está vacía**: tiene solo el encabezado. En un clon nuevo del repo, el respaldo de último recurso no funciona.
 3. **Un Bronce del mismo día ya descargado con v3 se reutiliza.** En la primera corrida de v4 hay que usar `force=True`.
 
@@ -130,4 +183,4 @@ Se probó fuera de Airflow, con la API real, porque Docker no estaba disponible:
 - Plata: 11.996 filas (4 duplicados entre lotes eliminados) × 151 columnas, 33 MB, ~15 s.
 - `validate` y `save` corren sin errores y generan el entregable y `ultimo_ok.csv.gz`.
 
-**Falta:** una corrida completa del DAG dentro de Airflow (`astro dev start`).
+**Falta:** una corrida completa del DAG dentro de Airflow. Se intentó con `astro dev start` (Docker Desktop): el DAG se importó sin errores y `wait_for_source` y `check_source` terminaron bien, pero `land_bronze` se colgó al crear `include/output`. La causa es que, con Docker Desktop, las escrituras en las carpetas montadas desde el host (`include`, `dags`) no responden, incluso en carpetas que ya existían. Es un problema del entorno local, no del DAG. El respaldo se generó ejecutando las mismas tareas fuera de Airflow.

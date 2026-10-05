@@ -26,7 +26,9 @@ La unidad de análisis es **1 artículo científico**, denominado *work* en Open
 
 ### Población
 
-Artículos (`type:article`) publicados en 2023, con abstract y no retractados. El filtro se aplica directamente en la API de OpenAlex.
+Artículos (`type:article`) de **Ciencia de Materiales** publicados en 2019, con abstract y no retractados. El campo se toma del tema principal del artículo (`primary_topic.field.id:25`, Materials Science, dominio Physical Sciences). El filtro se aplica directamente en la API de OpenAlex; la población disponible es de 107.963 artículos, de los que se toma una muestra aleatoria.
+
+Se eligió 2019 para que los artículos tengan más de 5 años de exposición a citas, y Ciencia de Materiales porque es un campo con mucho volumen de citas (mediana 9, 34% con 20 o más), pocos artículos sin citar (18%), buena cobertura de metadatos (76% en revistas core) y autorías chicas, sin las colaboraciones de cientos de autores de Física.
 
 | Grupo | Variable | Descripción |
 |---|---|---|
@@ -39,7 +41,7 @@ Artículos (`type:article`) publicados en 2023, con abstract y no retractados. E
 | | `countries_count` | Cantidad de países distintos |
 | Referencias | `referenced_works_count` | Cantidad de trabajos referenciados |
 | Temática | `domain` | Dominio de la temática principal: Health, Life, Physical o Social Sciences |
-| | `field` | Campo de la temática principal (ej. Medicine, Computer Science) |
+| | `field` | Campo de la temática principal (con el filtro actual, siempre Materials Science) |
 | Acceso abierto | `is_oa` | Si el artículo es de acceso abierto |
 | | `oa_status` | Tipo de acceso: gold, green, hybrid, bronze, diamond o closed |
 | | `apc_paid` | Si se pagó un cargo por publicación (APC) |
@@ -52,7 +54,22 @@ Artículos (`type:article`) publicados en 2023, con abstract y no retractados. E
 | | `abstract_length` | Cantidad de palabras del abstract |
 | Texto | `abstract` | Abstract reconstruido como texto |
 
-Estas son las **columnas derivadas**, pensadas para el análisis. Además, la capa Plata incluye **todos los campos de la API aplanados** (~130 columnas más; ver sección 5).
+Estas son las **columnas derivadas**, pensadas para el análisis. Después vienen las **columnas enriquecidas**, que salen de otros endpoints de OpenAlex (`/sources`, `/authors` e `/institutions`):
+
+| Grupo | Variable | Descripción |
+|---|---|---|
+| Revista | `source_pre_works` | Artículos publicados por la revista antes del año de publicación |
+| | `source_pre_cites` | Citas recibidas por la revista antes del año de publicación |
+| | `source_pre_cites_per_work` | Cociente de las dos anteriores: el prestigio previo de la revista |
+| | `source_apc_usd` | Cargo por publicar en la revista, en dólares (vacío si no cobra o no se sabe) |
+| Autores | `first_author_pre_works` / `first_author_pre_cites` | Trabajos y citas del primer autor antes del año de publicación |
+| | `last_author_pre_works` / `last_author_pre_cites` | Lo mismo para el último autor, que suele ser el jefe del grupo (vacío si hay un solo autor) |
+| | `first_author_country` | País de la afiliación del primer autor |
+| Instituciones | `institution_max_h_index` | h-index de la mejor institución entre las del artículo |
+
+> **Por qué "antes del año de publicación":** las métricas actuales de OpenAlex (h-index del autor, `2yr_mean_citedness` de la revista) incluyen citas posteriores al artículo, incluso las del propio artículo. Usarlas sería fuga del target. La historia se calcula con `counts_by_year`, sumando sólo los años anteriores. La excepción es `institution_max_h_index`, que es el valor actual: una institución tiene decenas de miles de trabajos, así que un artículo no lo mueve.
+
+Además, la capa Plata incluye **todos los campos de la API aplanados** (~130 columnas más; ver sección 5).
 
 > **Sobre los dos targets:** `is_top10_percent` está normalizado por campo, así que por construcción cada campo tiene ~10% de artículos en el top. Con ese target la temática no puede predecir el impacto; para evaluarla hay que usar `cited_by_count`.
 
@@ -114,7 +131,8 @@ De esta manera, una caída de la API no impide obtener un dataset válido para c
 | `land_bronze` | Capa Bronce | Realiza las peticiones HTTP masivas a OpenAlex. Descarga una muestra aleatoria reproducible (`sample` + `seed`) en lotes de hasta 10.000 works y almacena los JSON crudos comprimidos en `.json.gz`. Implementa idempotencia evitando volver a descargar el archivo del día si ya existe. |
 | `load_frozen` | Respaldo | Carga el respaldo congelado cuando la API no está disponible, permitiendo que el pipeline continúe utilizando datos de contingencia. |
 | `refine_silver` | Capa Plata |No realiza peticiones de red. Lee y descomprime los archivos Bronce de forma iterativa (línea por línea) para optimizar el uso de memoria RAM, calcula las columnas derivadas, aplana todos los campos de la API, elimina IDs duplicados y genera `openalex_silver.csv.gz`. |
-| `validate` | Control de Calidad | Utiliza la regla `NONE_FAILED_MIN_ONE_SUCCESS`. Verifica que el dataset tenga todas las columnas de `COLUMNAS_PLATA`, al menos 5.000 filas, que no existan IDs duplicados y que `cited_by_count` no contenga valores nulos. |
+| `enrich_silver` | Plata enriquecida | Pide a `/sources`, `/authors` e `/institutions` las entidades de cada artículo (revista, primer y último autor, instituciones), de a 100 por llamada. Calcula las `COLUMNAS_ENRIQUECIDAS` y genera `openalex_silver_enriched.csv.gz`. |
+| `validate` | Control de Calidad | Utiliza la regla `NONE_FAILED_MIN_ONE_SUCCESS`. Verifica que el dataset tenga todas las columnas de `COLUMNAS_PLATA` y `COLUMNAS_ENRIQUECIDAS`, al menos 5.000 filas, que no existan IDs duplicados y que `cited_by_count` no contenga valores nulos. |
 | `save` | Publicación | Genera el entregable final con fecha lógica (`openalex_YYYY-MM-DD.csv.gz`) en `OUTPUT_DIR` y actualiza `ULTIMO_OK` en `FROZEN_DIR` cuando los datos provienen de una ejecución exitosa contra la fuente. |
 
 ### Flujo general
@@ -144,6 +162,11 @@ De esta manera, una caída de la API no impide obtener un dataset válido para c
                      ┌─────────────────────┐
                      │   refine_silver     │
                      │       Plata         │
+                     └──────────┬──────────┘
+                                ▼
+                     ┌─────────────────────┐
+                     │   enrich_silver     │
+                     │  Plata enriquecida  │
                      └──────────┬──────────┘
                                 ▼
                      ┌─────────────────────┐
@@ -200,11 +223,10 @@ La compresión permite reducir aproximadamente un **80 % del espacio utilizado**
 
 La Capa Plata transforma los datos crudos de Bronce en un dataset estructurado y preparado para las etapas posteriores de análisis.
 
-Una característica importante es que:
+Se arma en dos tareas:
 
-> **La Capa Plata no realiza peticiones a Internet.**
-
-Toda la información utilizada proviene de los archivos almacenados en Bronce o del respaldo congelado.
+- **`refine_silver` no realiza peticiones a Internet.** Toda la información proviene de los archivos almacenados en Bronce.
+- **`enrich_silver` sí consulta OpenAlex**, pero sólo para traer datos de entidades relacionadas con cada artículo (ver "Enriquecimiento" más abajo).
 
 ### Transformaciones principales
 
@@ -226,6 +248,21 @@ openalex_silver.csv.gz
 
 Se lee directamente con `pd.read_csv("openalex_silver.csv.gz")`. Para recuperar una lista: `json.loads(df["authorships"][0])`.
 
+### Enriquecimiento
+
+Los works sólo traen los IDs de su revista, sus autores y sus instituciones. `enrich_silver`:
+
+1. Lee de Plata sólo las columnas con IDs (`id`, `primary_location_source_id`, `authorships`).
+2. Junta los IDs únicos: revistas, primer y último autor de cada artículo, e instituciones.
+3. Los pide a `/sources`, `/authors` e `/institutions` con el filtro `openalex_id:A|B|...`, de a 100 por llamada. Para 10.000 artículos son unas 270 llamadas.
+4. Calcula las `COLUMNAS_ENRIQUECIDAS` (ver sección 1) y reescribe Plata por bloques de 2.000 filas, con las columnas nuevas después de las derivadas.
+
+Archivo resultante:
+
+```text
+openalex_silver_enriched.csv.gz
+```
+
 > **Cuidado en el análisis:** el archivo incluye campos calculados a partir de las citas (`fwci`, `citation_normalized_percentile_*`, `cited_by_percentile_year_*`, `counts_by_year`). Sirven como target, nunca como predictores. Además, varias columnas derivadas repiten información de la API con un nombre más corto (ej. `is_oa` = `open_access_is_oa`).
 
 ---
@@ -244,7 +281,7 @@ NONE_FAILED_MIN_ONE_SUCCESS
 
 El pipeline comprueba que:
 
-- El archivo tenga **todas las columnas** del esquema `COLUMNAS_PLATA`. Si falta alguna (por ejemplo, un respaldo generado por una versión anterior del DAG), falla sin correr el resto de los chequeos.
+- El archivo tenga **todas las columnas** de los esquemas `COLUMNAS_PLATA` y `COLUMNAS_ENRIQUECIDAS`. Si falta alguna (por ejemplo, un respaldo generado por una versión anterior del DAG), falla sin correr el resto de los chequeos.
 - El dataset contenga **al menos 5.000 filas** (`FILAS_MINIMAS`).
 - No existan IDs duplicados.
 - `cited_by_count` no contenga valores nulos.
@@ -316,7 +353,7 @@ Gestiona parámetros como:
 - `mailto`
 - `page` y `per_page` (200 works por página)
 - `sample` y `seed`
-- `filter` (constante `FILTRO`: artículos de 2023 con abstract, no retractados)
+- `filter` (constante `FILTRO`: artículos de Ciencia de Materiales de 2019 con abstract, no retractados)
 - API key
 
 Devuelve la lista de resultados de esa página.
