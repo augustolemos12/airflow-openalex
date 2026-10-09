@@ -3,6 +3,15 @@
 .DS_Store
 airflow_settings.yaml
 /include/output
+
+# Datos pesados: se regeneran corriendo el DAG.
+# El respaldo ULTIMO_OK lo sobreescribe cada corrida exitosa; sólo se versiona la semilla.
+/include/frozen/*
+!/include/frozen/openalex_snapshot.csv
+*.csv.gz
+*.json.gz
+*.parquet
+*.pkl
 __pycache__/
 astro
 .venv

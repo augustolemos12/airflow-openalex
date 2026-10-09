@@ -24,16 +24,56 @@ La unidad de análisis es **1 artículo científico**, denominado *work* en Open
 
 ### Variables utilizadas
 
-| Variable | Descripción |
-|---|---|
-| `authors_count` | Cantidad de autores |
-| `referenced_works_count` | Cantidad de trabajos referenciados |
-| `is_oa` | Indica si el artículo es de acceso abierto |
-| `publication_year` | Año de publicación |
-| `type` | Tipo de publicación |
-| `institutions_count` | Cantidad de instituciones asociadas |
-| `countries_count` | Cantidad de países asociados |
-| `cited_by_count` | Cantidad de citas recibidas (variable target) |
+### Población
+
+Artículos (`type:article`) de **Ciencia de Materiales** publicados en 2019, con abstract y no retractados. El campo se toma del tema principal del artículo (`primary_topic.field.id:25`, Materials Science, dominio Physical Sciences). El filtro se aplica directamente en la API de OpenAlex; la población disponible es de 107.963 artículos, de los que se toma una muestra aleatoria.
+
+Se eligió 2019 para que los artículos tengan más de 5 años de exposición a citas, y Ciencia de Materiales porque es un campo con mucho volumen de citas (mediana 9, 34% con 20 o más), pocos artículos sin citar (18%), buena cobertura de metadatos (76% en revistas core) y autorías chicas, sin las colaboraciones de cientos de autores de Física.
+
+| Grupo | Variable | Descripción |
+|---|---|---|
+| Identificación | `id` | ID de OpenAlex (ej. `W4385245566`) |
+| | `title` | Título (sólo referencia, no es predictor) |
+| **Target** | `cited_by_count` | Cantidad de citas recibidas |
+| | `is_top10_percent` | Si está en el 10% más citado de su campo y año (`citation_normalized_percentile`) |
+| Autores | `authors_count` | Cantidad de autores |
+| | `institutions_count` | Cantidad de instituciones distintas |
+| | `countries_count` | Cantidad de países distintos |
+| Referencias | `referenced_works_count` | Cantidad de trabajos referenciados |
+| Temática | `domain` | Dominio de la temática principal: Health, Life, Physical o Social Sciences |
+| | `field` | Campo de la temática principal (con el filtro actual, siempre Materials Science) |
+| Acceso abierto | `is_oa` | Si el artículo es de acceso abierto |
+| | `oa_status` | Tipo de acceso: gold, green, hybrid, bronze, diamond o closed |
+| | `apc_paid` | Si se pagó un cargo por publicación (APC) |
+| Fuente | `source_type` | Tipo de fuente (journal, repository, conference, ...) |
+| | `source_is_core` | Si la fuente pertenece al conjunto "core" de OpenAlex |
+| | `is_in_doaj` | Si la fuente está indexada en el Directory of Open Access Journals |
+| Controles | `funders_count` | Cantidad de financiadores |
+| | `language` | Idioma (código ISO 639-1 en minúsculas) |
+| | `publication_month` | Mes de publicación (1-12); controla el tiempo de exposición a citas |
+| | `abstract_length` | Cantidad de palabras del abstract |
+| Texto | `abstract` | Abstract reconstruido como texto |
+
+Estas son las **columnas derivadas**, pensadas para el análisis. Después vienen las **columnas enriquecidas**, que salen de otros endpoints de OpenAlex (`/sources`, `/authors` e `/institutions`):
+
+| Grupo | Variable | Descripción |
+|---|---|---|
+| Revista | `source_pre_works` | Artículos publicados por la revista antes del año de publicación |
+| | `source_pre_cites` | Citas recibidas por la revista antes del año de publicación |
+| | `source_pre_cites_per_work` | Cociente de las dos anteriores: el prestigio previo de la revista |
+| | `source_apc_usd` | Cargo por publicar en la revista, en dólares (vacío si no cobra o no se sabe) |
+| Autores | `first_author_pre_works` / `first_author_pre_cites` | Trabajos y citas del primer autor antes del año de publicación |
+| | `last_author_pre_works` / `last_author_pre_cites` | Lo mismo para el último autor, que suele ser el jefe del grupo (vacío si hay un solo autor) |
+| | `first_author_country` | País de la afiliación del primer autor |
+| Instituciones | `institution_max_h_index` | h-index de la mejor institución entre las del artículo |
+
+> **Por qué "antes del año de publicación":** las métricas actuales de OpenAlex (h-index del autor, `2yr_mean_citedness` de la revista) incluyen citas posteriores al artículo, incluso las del propio artículo. Usarlas sería fuga del target. La historia se calcula con `counts_by_year`, sumando sólo los años anteriores. La excepción es `institution_max_h_index`, que es el valor actual: una institución tiene decenas de miles de trabajos, así que un artículo no lo mueve.
+
+Además, la capa Plata incluye **todos los campos de la API aplanados** (~130 columnas más; ver sección 5).
+
+> **Sobre los dos targets:** `is_top10_percent` está normalizado por campo, así que por construcción cada campo tiene ~10% de artículos en el top. Con ese target la temática no puede predecir el impacto; para evaluarla hay que usar `cited_by_count`.
+
+> **Variables excluidas por fuga de datos:** `fwci`, `cited_by_percentile_year` y `counts_by_year` se calculan a partir de las citas y no deben usarse como predictores.
 
 ---
 
@@ -88,11 +128,12 @@ De esta manera, una caída de la API no impide obtener un dataset válido para c
 |---|---|---|
 | `wait_for_source` | `@task.sensor` | Consulta la API de OpenAlex mediante `HttpHook`, utilizando `CONN_ID = "openalex_api"`. Cuando confirma disponibilidad devuelve `PokeReturnValue(is_done=True, xcom_value=True)`. |
 | `check_source` | `@task.branch` | Decide el camino del DAG (`land_bronze` o `load_frozen`) según el resultado del sensor recuperado mediante XCom. |
-| `land_bronze` | Capa Bronce | Realiza las peticiones HTTP masivas a OpenAlex. Utiliza paginación mediante cursor para superar el límite de 10.000 filas y almacena los JSON crudos comprimidos en `.json.gz`. Implementa idempotencia evitando volver a descargar el archivo del día si ya existe. |
+| `land_bronze` | Capa Bronce | Realiza las peticiones HTTP masivas a OpenAlex. Descarga una muestra aleatoria reproducible (`sample` + `seed`) en lotes de hasta 10.000 works y almacena los JSON crudos comprimidos en `.json.gz`. Implementa idempotencia evitando volver a descargar el archivo del día si ya existe. |
 | `load_frozen` | Respaldo | Carga el respaldo congelado cuando la API no está disponible, permitiendo que el pipeline continúe utilizando datos de contingencia. |
-| `refine_silver` | Capa Plata |No realiza peticiones de red. Lee y descomprime los archivos Bronce de forma iterativa (línea por línea) para optimizar el uso de memoria RAM, desanida las estructuras JSON, tipa las columnas, elimina IDs duplicados y genera `openalex_silver.csv`. |
-| `validate` | Control de Calidad | Utiliza la regla `NONE_FAILED_MIN_ONE_SUCCESS`. Verifica que el dataset tenga más de 1.000 filas, que no existan IDs duplicados y que `cited_by_count` no contenga valores nulos. |
-| `save` | Publicación | Genera el entregable final con fecha lógica (`openalex_YYYY-MM-DD.csv`) en `OUTPUT_DIR` y actualiza `ULTIMO_OK` en `FROZEN_DIR` cuando los datos provienen de una ejecución exitosa contra la fuente. |
+| `refine_silver` | Capa Plata |No realiza peticiones de red. Lee y descomprime los archivos Bronce de forma iterativa (línea por línea) para optimizar el uso de memoria RAM, calcula las columnas derivadas, aplana todos los campos de la API, elimina IDs duplicados y genera `openalex_silver.csv.gz`. |
+| `enrich_silver` | Plata enriquecida | Pide a `/sources`, `/authors` e `/institutions` las entidades de cada artículo (revista, primer y último autor, instituciones), de a 100 por llamada. Calcula las `COLUMNAS_ENRIQUECIDAS` y genera `openalex_silver_enriched.csv.gz`. |
+| `validate` | Control de Calidad | Utiliza la regla `NONE_FAILED_MIN_ONE_SUCCESS`. Falla si faltan columnas de `COLUMNAS_PLATA` o `COLUMNAS_ENRIQUECIDAS`, o si hay menos de 5.000 filas. Además corre seis chequeos de calidad (clave única, ancho, mezcla de tipos, nulos, columnas vacías) que registran advertencias sin frenar el pipeline. |
+| `save` | Publicación | Genera el entregable final con fecha lógica (`openalex_YYYY-MM-DD.csv.gz`) en `OUTPUT_DIR` y actualiza `ULTIMO_OK` en `FROZEN_DIR` cuando los datos provienen de una ejecución exitosa contra la fuente. |
 
 ### Flujo general
 
@@ -124,6 +165,11 @@ De esta manera, una caída de la API no impide obtener un dataset válido para c
                      └──────────┬──────────┘
                                 ▼
                      ┌─────────────────────┐
+                     │   enrich_silver     │
+                     │  Plata enriquecida  │
+                     └──────────┬──────────┘
+                                ▼
+                     ┌─────────────────────┐
                      │      validate       │
                      │   Calidad de datos  │
                      └──────────┬──────────┘
@@ -147,15 +193,19 @@ La Capa Bronce conserva los datos prácticamente en el estado en que fueron obte
 - Compresión mediante `gzip`.
 - Archivos con extensión `.json.gz`.
 - Almacenamiento local.
-- Paginación mediante cursor.
+- Muestreo aleatorio reproducible.
 - Operación idempotente.
 - No se sobrescriben innecesariamente datos ya descargados.
 
-### Paginación por cursor
+### Muestreo aleatorio
 
-OpenAlex limita las consultas paginadas, por lo que el pipeline utiliza el mecanismo de **cursor pagination**.
+Si no se indica un orden, OpenAlex devuelve los works **ordenados por `cited_by_count` de mayor a menor**. Descargar "los primeros N" resultados produciría una muestra formada sólo por los papers más citados del año, sin casos de bajo impacto contra los cuales comparar.
 
-Esto permite continuar solicitando páginas sucesivas hasta alcanzar la cantidad de registros objetivo, evitando depender de una única consulta limitada a 10.000 resultados.
+Por eso el pipeline pide una **muestra aleatoria** mediante los parámetros `sample` y `seed`:
+
+- La misma semilla devuelve siempre la misma muestra, por lo que la descarga es reproducible.
+- `sample` admite como máximo **10.000** works y sólo funciona con paginación por página (`page`), no con cursor.
+- Para superar ese límite se piden varios lotes con semillas consecutivas (`semilla`, `semilla + 1`, ...). Dos lotes pueden compartir algún work; la Capa Plata elimina los duplicados.
 
 ### Compresión
 
@@ -173,27 +223,47 @@ La compresión permite reducir aproximadamente un **80 % del espacio utilizado**
 
 La Capa Plata transforma los datos crudos de Bronce en un dataset estructurado y preparado para las etapas posteriores de análisis.
 
-Una característica importante es que:
+Se arma en dos tareas:
 
-> **La Capa Plata no realiza peticiones a Internet.**
-
-Toda la información utilizada proviene de los archivos almacenados en Bronce o del respaldo congelado.
+- **`refine_silver` no realiza peticiones a Internet.** Toda la información proviene de los archivos almacenados en Bronce.
+- **`enrich_silver` sí consulta OpenAlex**, pero sólo para traer datos de entidades relacionadas con cada artículo (ver "Enriquecimiento" más abajo).
 
 ### Transformaciones principales
 
-1. Lectura del archivo `.json.gz`.
-2. Descompresión del contenido.
-3. Desanidamiento de estructuras JSON.
-4. Selección de variables relevantes.
-5. Conversión de tipos.
-6. Eliminación de IDs duplicados.
-7. Generación del dataset estructurado.
+1. Lectura del archivo `.json.gz`, línea por línea.
+2. Eliminación de IDs duplicados.
+3. Cálculo de las **columnas derivadas** (`COLUMNAS_PLATA`, ver sección 1), que van primero en el CSV.
+4. **Aplanado de todos los campos de la API** (`aplanar`):
+   - Objetos anidados → una columna por hoja, con `_` como separador (`primary_location.source.type` → `primary_location_source_type`).
+   - Listas (`authorships`, `topics`, `locations`, `referenced_works`, ...) → texto JSON en la celda, más una columna `<lista>_count` para las de primer nivel.
+   - Si una columna aplanada se llama igual que una derivada, se queda la derivada (ej. `id` acortado, `language` normalizado).
+5. Reconstrucción del abstract: `abstract_inverted_index` se reemplaza por `abstract` (texto) y `abstract_length`.
+6. Escritura en dos pasadas: la primera junta todas las columnas que aparecen en los datos y la segunda escribe las filas, sin cargar el dataset completo en memoria.
+
+Archivo resultante (~150 columnas, ~33 MB comprimido para 12.000 artículos):
+
+```text
+openalex_silver.csv.gz
+```
+
+Se lee directamente con `pd.read_csv("openalex_silver.csv.gz")`. Para recuperar una lista: `json.loads(df["authorships"][0])`.
+
+### Enriquecimiento
+
+Los works sólo traen los IDs de su revista, sus autores y sus instituciones. `enrich_silver`:
+
+1. Lee de Plata sólo las columnas con IDs (`id`, `primary_location_source_id`, `authorships`).
+2. Junta los IDs únicos: revistas, primer y último autor de cada artículo, e instituciones.
+3. Los pide a `/sources`, `/authors` e `/institutions` con el filtro `openalex_id:A|B|...`, de a 100 por llamada. Para 10.000 artículos son unas 270 llamadas.
+4. Calcula las `COLUMNAS_ENRIQUECIDAS` (ver sección 1) y reescribe Plata por bloques de 2.000 filas, con las columnas nuevas después de las derivadas.
 
 Archivo resultante:
 
 ```text
-openalex_silver.csv
+openalex_silver_enriched.csv.gz
 ```
+
+> **Cuidado en el análisis:** el archivo incluye campos calculados a partir de las citas (`fwci`, `citation_normalized_percentile_*`, `cited_by_percentile_year_*`, `counts_by_year`). Sirven como target, nunca como predictores. Además, varias columnas derivadas repiten información de la API con un nombre más corto (ej. `is_oa` = `open_access_is_oa`).
 
 ---
 
@@ -211,9 +281,17 @@ NONE_FAILED_MIN_ONE_SUCCESS
 
 El pipeline comprueba que:
 
-- El dataset contenga **más de 1.000 filas**.
-- No existan IDs duplicados.
-- `cited_by_count` no contenga valores nulos.
+| # | Chequeo | Si no se cumple |
+|---|---|---|
+| 0 | El archivo tiene **todas las columnas** de `COLUMNAS_PLATA` y `COLUMNAS_ENRIQUECIDAS` (por ejemplo, falla con un respaldo generado por una versión anterior del DAG) | **Falla el DAG** |
+| 1 | La clave `id` no tiene duplicados | Advertencia |
+| 2 | Hay **al menos 5.000 filas** (`FILAS_MINIMAS`) | **Falla el DAG** |
+| 3 | Hay 5 o más columnas útiles (no todo nulos) | Advertencia |
+| 4 | Hay columnas numéricas y categóricas | Advertencia |
+| 5 | Nulos: se registra el % por columna; se avisa si `cited_by_count` o `is_top10_percent` tienen nulos (OpenAlex no calcula el percentil para algunos artículos) | Advertencia |
+| 6 | Ninguna columna tiene 100 % de nulos | Advertencia |
+
+Las advertencias quedan en el log de la tarea y el pipeline continúa.
 
 Si alguna de estas condiciones críticas no se cumple, el pipeline no debería considerar válido el dataset generado.
 
@@ -226,8 +304,10 @@ La tarea `save` publica el dataset final utilizando la fecha lógica de ejecuci�
 Formato:
 
 ```text
-openalex_YYYY-MM-DD.csv
+openalex_YYYY-MM-DD.csv.gz
 ```
+
+(Conserva la extensión de origen: si los datos vienen de la semilla `openalex_snapshot.csv`, el entregable es `.csv`.)
 
 El archivo se almacena en:
 
@@ -238,7 +318,7 @@ OUTPUT_DIR
 Cuando los datos provienen de una ejecución exitosa contra OpenAlex, también se actualiza la copia de respaldo:
 
 ```text
-FROZEN_DIR/ULTIMO_OK
+FROZEN_DIR/ultimo_ok.csv.gz
 ```
 
 Este archivo permite recuperar los datos de la última ejecución válida si OpenAlex deja de estar disponible en una ejecución posterior.
@@ -269,21 +349,19 @@ Su objetivo es:
 - Reducir el espacio utilizado.
 - Mantener un formato que pueda ser regenerado posteriormente.
 
-### `fetch_page(session, cursor, correo, api_key)`
+### `fetch_page(session, pagina, tamanio, semilla, correo, api_key)`
 
 Aísla la lógica de comunicación con OpenAlex.
 
 Gestiona parámetros como:
 
 - `mailto`
-- `cursor`
-- `filter`
+- `page` y `per_page` (200 works por página)
+- `sample` y `seed`
+- `filter` (constante `FILTRO`: artículos de Ciencia de Materiales de 2019 con abstract, no retractados)
 - API key
 
-Devuelve:
-
-- La lista de resultados obtenidos.
-- El `next_cursor` necesario para solicitar la siguiente página.
+Devuelve la lista de resultados de esa página.
 
 ---
 
@@ -295,6 +373,7 @@ El DAG utiliza parámetros para controlar el comportamiento de cada ejecución.
 |---|---|---|
 | `filas_objetivo` | Cantidad de registros que se intenta descargar desde OpenAlex. | `12000` |
 | `correo_api` | Dirección de correo institucional utilizada para acceder al *Polite Pool* de OpenAlex. | Configurado en la ejecución |
+| `semilla` | Seed de la muestra aleatoria. La misma semilla reproduce la misma muestra. | `42` |
 | `force` | Fuerza una nueva ingesta ignorando los archivos Bronce existentes. | `False` |
 
 ### `filas_objetivo`
