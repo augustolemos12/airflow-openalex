@@ -361,7 +361,23 @@ Gestiona parámetros como:
 - `filter` (constante `FILTRO`: artículos de Ciencia de Materiales de 2019 con abstract, no retractados)
 - API key
 
-Devuelve la lista de resultados de esa página.
+Devuelve la lista de resultados de esa página. El pedido pasa por `get_con_reintentos`.
+
+### `get_con_reintentos(session, url, parametros, timeout)`
+
+Hace el GET a OpenAlex y **reintenta sólo ante errores transitorios**: corte de conexión, timeout, 429 (demasiados pedidos) o 5xx (el servidor falló o tardó demasiado). Espera 5, 10, 20 y 40 segundos entre intentos; ante un 429 respeta el `Retry-After` que indique la API.
+
+- **Cuota diaria agotada:** la API key tiene un tope de US$ 1 por día (unos 10.000 pedidos; una corrida completa hace ~330). Si un 429 pide esperar más de `ESPERA_MAX_S` (120 s), la tarea falla enseguida con `AirflowFailException`, sin reintentos, y el log indica cuántas horas faltan para que se renueve la cuota.
+
+- Un error no transitorio (por ejemplo, un 400 por un filtro mal armado) se lanza enseguida.
+- Si se agotan los 4 reintentos, se lanza el error y queda el reintento de la tarea como último recurso.
+- Los mensajes del log no incluyen la URL completa, porque lleva la API key como parámetro.
+
+Sin este helper, un solo 504 entre los ~270 pedidos de `enrich_silver` hacía que Airflow reintentara la tarea entera y volviera a descargar todo (unos 4 minutos perdidos).
+
+### `fetch_entidades(session, tipo, ids, select, correo, api_key)`
+
+Pide a `/sources`, `/authors` o `/institutions` las entidades indicadas, de a 100 IDs por pedido (filtro `openalex_id:A|B|...`), usando `get_con_reintentos`. Devuelve `{id: entidad}`.
 
 ---
 

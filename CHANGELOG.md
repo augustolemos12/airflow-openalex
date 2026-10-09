@@ -1,5 +1,26 @@
 # Registro de cambios
 
+## v7: reintentos por pedido HTTP
+
+**Archivos modificados:** `dags/openalex_ingest.py`, `README.md`
+
+**Motivo:** en una corrida, OpenAlex devolvió un 504 (Gateway Timeout) en uno de los ~270 pedidos de `enrich_silver`. Airflow reintentó la tarea entera, que volvió a descargar revistas, autores e instituciones desde cero: la corrida pasó de ~7,5 a 11,5 minutos. Si la API hubiera seguido inestable, se podían agotar los reintentos de la tarea y fallar el DAG.
+
+**Cambio:** nuevo helper `get_con_reintentos`, usado por `fetch_page` (Bronce) y `fetch_entidades` (Plata enriquecida).
+
+- Reintenta **sólo el pedido que falló**, hasta 4 veces, con esperas de 5, 10, 20 y 40 segundos.
+- Sólo ante errores transitorios: corte de conexión, timeout, 429 y 5xx. Ante un 429 respeta `Retry-After`.
+- Los demás errores (ej. 400) se lanzan enseguida, porque reintentarlos daría lo mismo.
+- Los reintentos de la tarea (`retries=3`) siguen como último recurso.
+- Los mensajes del log no incluyen la URL completa, que lleva la API key.
+
+**Problemas encontrados al probarlo, y corregidos:**
+
+- **Cuota diaria de la API.** En una corrida, OpenAlex respondió 429 con `Retry-After` de ~5 horas (la API key tiene un tope de US$ 1 por día, unos 10.000 pedidos; una corrida completa hace ~330). La primera versión del helper respetaba esa espera y la tarea quedaba dormida. Ahora, si la espera pedida supera `ESPERA_MAX_S` (120 s), se lanza `AirflowFailException`: la tarea falla enseguida con un mensaje claro y sin reintentos, que gastarían más cuota.
+- **Memoria.** `enrich_silver` murió una vez por falta de memoria (OOM) al reescribir Plata. La máquina virtual de Docker tenía 3,5 GB, compartidos con el resto de Airflow y otros contenedores. Ahora la tarea libera las autorías parseadas y las entidades descargadas antes de reescribir, reescribe de a 1.000 filas en lugar de 2.000 y ya no parsea dos veces el JSON de autorías.
+
+---
+
 ## v6: Ciencia de Materiales 2019 y Plata enriquecida
 
 **Archivos modificados:** `dags/openalex_ingest.py`, `README.md`

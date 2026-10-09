@@ -25,12 +25,16 @@ guarda el resultado en CSV y realiza validaciones de calidad de datos.
 """
 from __future__ import annotations
 
+import gc
 import gzip
 import json
 import logging
+import time
 from pathlib import Path
 
 import pendulum
+import requests
+from airflow.exceptions import AirflowFailException
 from airflow.providers.http.hooks.http import HttpHook
 from airflow.sdk import Param, PokeReturnValue, dag, task
 from airflow.task.trigger_rule import TriggerRule
@@ -119,6 +123,17 @@ COLUMNAS_ENRIQUECIDAS = [
 # El filtro `openalex_id:A|B|...` admite hasta 100 IDs por pedido.
 POR_LOTE_ENTIDADES = 100
 
+# Reintentos por pedido HTTP ante errores transitorios de la API.
+# Sin esto, un solo 504 hace que Airflow reintente la tarea entera y vuelva
+# a descargar todo. Esperas: 5, 10, 20 y 40 segundos (75 s en total).
+REINTENTOS_HTTP = 4
+ESPERA_BASE_S   = 5
+# 429 = demasiados pedidos; 5xx = el servidor falló o tardó demasiado.
+ESTADOS_TRANSITORIOS = {429, 500, 502, 503, 504}
+# Si un 429 pide esperar más que esto, es la cuota diaria agotada (la API key
+# tiene un tope de US$ 1 por día): se corta sin reintentar, en vez de dormir horas.
+ESPERA_MAX_S = 120
+
 # Campos de la API que no se aplanan tal cual. El abstract es un dict
 # {palabra: [posiciones]}: aplanarlo crearía una columna por palabra.
 # Se reemplaza por `abstract` (texto reconstruido) y `abstract_length`.
@@ -132,6 +147,50 @@ CAMPOS_NO_APLANADOS = {"abstract_inverted_index"}
 def bronze_path(fecha_str: str) -> Path:
     """Ruta canónica del archivo bronce para una fecha dada."""
     return BRONCE_DIR / f"openalex_raw_{fecha_str}.json.gz"
+
+def get_con_reintentos(session, url: str, parametros: dict, timeout: int):
+    """GET que reintenta sólo ante errores transitorios, con espera creciente.
+
+    Transitorios: corte de conexión, timeout o un estado de ESTADOS_TRANSITORIOS.
+    Cualquier otro error (ej. 400 por un filtro mal armado) se lanza enseguida:
+    reintentarlo daría lo mismo. Si se agotan los reintentos, se lanza el último
+    error y queda el reintento de la tarea como último recurso.
+
+    Los mensajes del log no incluyen la URL: lleva la API key como parámetro.
+    """
+    for intento in range(REINTENTOS_HTTP + 1):
+        try:
+            resp = session.get(url, params=parametros, timeout=timeout)
+            if resp.status_code not in ESTADOS_TRANSITORIOS:
+                # raise_for_status() lanza una excepción si el estado es un error
+                resp.raise_for_status()
+                return resp
+            motivo = f"HTTP {resp.status_code}"
+        except (requests.ConnectionError, requests.Timeout) as e:
+            motivo = type(e).__name__
+            resp = None
+
+        # Ante un 429, la API puede indicar cuánto esperar. Una espera larga es la
+        # cuota diaria agotada: AirflowFailException corta también los reintentos
+        # de la tarea, que fallarían igual y gastarían más cuota.
+        pedida = resp.headers.get("Retry-After", "") if resp is not None else ""
+        if pedida.isdigit() and int(pedida) > ESPERA_MAX_S:
+            raise AirflowFailException(
+                f"OpenAlex pide esperar {int(pedida) / 3600:.1f} h ({motivo}): se agotó la "
+                "cuota diaria de la API key. Volver a correr el DAG cuando se renueve."
+            )
+        if intento == REINTENTOS_HTTP:
+            break
+        espera = ESPERA_BASE_S * 2 ** intento
+        if pedida.isdigit():
+            espera = max(espera, int(pedida))
+        log.warning("Pedido a %s falló (%s). Reintento %s de %s en %s s.",
+                    url, motivo, intento + 1, REINTENTOS_HTTP, espera)
+        time.sleep(espera)
+
+    if resp is not None:
+        resp.raise_for_status()
+    raise requests.ConnectionError(f"{url}: {motivo} tras {REINTENTOS_HTTP} reintentos.")
 
 def fetch_page(session, pagina: int, tamanio: int, semilla: int,
                correo: str, api_key: str | None) -> list:
@@ -151,10 +210,7 @@ def fetch_page(session, pagina: int, tamanio: int, semilla: int,
     if api_key:
         parametros["api_key"] = api_key
 
-    resp = session.get(BASE_URL, params=parametros, timeout=30)
-    # raise_for_status() es un método de la clase Response que se usa para 
-    # lanzar una excepción si el código de estado de la respuesta es un error
-    resp.raise_for_status()
+    resp = get_con_reintentos(session, BASE_URL, parametros, timeout=30)
     # resp.json() es un método de la clase Response que se usa para 
     # convertir la respuesta en un objeto python
     data = resp.json()
@@ -269,8 +325,7 @@ def fetch_entidades(session, tipo: str, ids: set, select: str,
         }
         if api_key:
             parametros["api_key"] = api_key
-        resp = session.get(f"{API_URL}/{tipo}", params=parametros, timeout=60)
-        resp.raise_for_status()
+        resp = get_con_reintentos(session, f"{API_URL}/{tipo}", parametros, timeout=60)
         for entidad in resp.json().get("results", []):
             entidades[id_corto(entidad["id"])] = entidad
     log.info("%s: %s de %s encontradas", tipo, len(entidades), len(ids))
@@ -284,11 +339,10 @@ def historia_previa(entidad: dict | None) -> tuple[int | None, int | None]:
     return (sum(c["works_count"] for c in anteriores),
             sum(c["cited_by_count"] for c in anteriores))
 
-def columnas_enriquecidas(fila: pd.Series, revistas: dict, autores: dict,
+def columnas_enriquecidas(id_revista, autorias: list, revistas: dict, autores: dict,
                           instituciones: dict) -> dict:
     """Arma las COLUMNAS_ENRIQUECIDAS de un paper a partir de las entidades ya descargadas."""
-    autorias = json.loads(fila["authorships"]) if isinstance(fila["authorships"], str) else []
-    revista  = revistas.get(id_corto(fila["primary_location_source_id"]))
+    revista  = revistas.get(id_corto(id_revista))
     primero  = autores.get(id_corto(autorias[0]["author"].get("id"))) if autorias else None
     # Con un solo autor, "último" sería el mismo: se deja vacío.
     ultimo   = autores.get(id_corto(autorias[-1]["author"].get("id"))) if len(autorias) > 1 else None
@@ -610,16 +664,21 @@ def openalex_ingest():
                                         "id,summary_stats", correo, api_key)
 
         extra = pd.DataFrame(
-            [columnas_enriquecidas(fila, revistas, autores, instituciones)
-             for _, fila in ids.iterrows()],
+            [columnas_enriquecidas(id_revista, a, revistas, autores, instituciones)
+             for id_revista, a in zip(ids["primary_location_source_id"], autorias)],
             columns=COLUMNAS_ENRIQUECIDAS,
         )
         extra.insert(0, "id", ids["id"])
 
+        # Las autorías parseadas y las entidades ocupan cientos de MB y ya no hacen
+        # falta: se liberan antes de reescribir, que es el pico de memoria de la tarea.
+        del ids, autorias, revistas, autores, instituciones
+        gc.collect()
+
         # Reescribe Plata por bloques, con las columnas nuevas después de COLUMNAS_PLATA.
         destino = PLATA_DIR / "openalex_silver_enriched.csv.gz"
         with gzip.open(destino, "wt", newline="", encoding="utf-8") as f_out:
-            for n, bloque in enumerate(pd.read_csv(ruta_plata, chunksize=2000, low_memory=False)):
+            for n, bloque in enumerate(pd.read_csv(ruta_plata, chunksize=1000, low_memory=False)):
                 bloque = bloque.merge(extra, on="id", how="left")
                 resto = [c for c in bloque.columns
                          if c not in COLUMNAS_PLATA and c not in COLUMNAS_ENRIQUECIDAS]
